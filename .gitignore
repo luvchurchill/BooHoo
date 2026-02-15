@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# Training artifacts
+*.pth
+processed_dataset/
+processed_dataset_*/
+
+# OS/editor
+.DS_Store
+Thumbs.db

@@ -10,6 +10,7 @@ from torchvision import transforms
 import librosa
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, recall_score
 from tqdm import tqdm
 
 class DeepInfantDataset(Dataset):
@@ -97,6 +98,8 @@ class DeepInfantDataset(Dataset):
         
         # Convert to log scale
         mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+        # Per-sample normalization for stabler optimization.
+        mel_spec = (mel_spec - np.mean(mel_spec)) / (np.std(mel_spec) + 1e-6)
         
         return torch.FloatTensor(mel_spec)
     
@@ -175,8 +178,20 @@ class DeepInfantModel(nn.Module):
         x = self.classifier(x)
         return x
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50, device='cuda'):
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    num_epochs=50,
+    device='cuda',
+    scheduler=None,
+    grad_clip=1.0,
+    checkpoint_path='deepinfant.pth',
+):
     model = model.to(device)
+    best_val_f1 = -1.0
     best_val_acc = 0.0
     
     for epoch in range(num_epochs):
@@ -194,6 +209,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             
             train_loss += loss.item()
@@ -208,6 +225,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         val_loss = 0.0
         val_correct = 0
         val_total = 0
+        val_preds = []
+        val_labels = []
         
         with torch.no_grad():
             for inputs, labels in val_loader:
@@ -221,18 +240,65 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
+                val_preds.extend(predicted.cpu().tolist())
+                val_labels.extend(labels.cpu().tolist())
         
         val_acc = 100. * val_correct / val_total
+        val_macro_f1 = f1_score(val_labels, val_preds, average='macro', zero_division=0)
+        val_balanced_acc = recall_score(val_labels, val_preds, average='macro', zero_division=0)
+
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_loss / len(val_loader))
+            else:
+                scheduler.step()
         
         print(f'Epoch {epoch+1}/{num_epochs}:')
         print(f'Train Loss: {train_loss/len(train_loader):.4f}, Train Acc: {train_acc:.2f}%')
         print(f'Val Loss: {val_loss/len(val_loader):.4f}, Val Acc: {val_acc:.2f}%')
+        print(f'Val Macro-F1: {val_macro_f1:.4f}, Val Balanced Acc: {val_balanced_acc:.4f}')
+        print(f"LR: {optimizer.param_groups[0]['lr']:.6f}")
         
-        # Save best model
-        if val_acc > best_val_acc:
+        # Save best model by macro-F1, then by accuracy for tie-break.
+        is_better = (
+            val_macro_f1 > best_val_f1
+            or (abs(val_macro_f1 - best_val_f1) < 1e-8 and val_acc > best_val_acc)
+        )
+        if is_better:
+            best_val_f1 = val_macro_f1
             best_val_acc = val_acc
-            torch.save(model.state_dict(), 'deepinfant.pth')
-            print(f"Saved improved checkpoint to deepinfant.pth (val_acc={val_acc:.2f}%)")
+            torch.save(model.state_dict(), checkpoint_path)
+            print(
+                f"Saved improved checkpoint to {checkpoint_path} "
+                f"(val_macro_f1={val_macro_f1:.4f}, val_acc={val_acc:.2f}%)"
+            )
+
+
+def compute_class_weights(class_counts, scheme='sqrt_inv', max_weight=4.0):
+    counts = np.asarray(class_counts, dtype=np.float64)
+    weights = np.ones_like(counts, dtype=np.float64)
+    nonzero = counts > 0
+    if not nonzero.any() or scheme == 'none':
+        return torch.tensor(weights, dtype=torch.float32)
+
+    if scheme == 'inv':
+        weights[nonzero] = 1.0 / counts[nonzero]
+    elif scheme == 'sqrt_inv':
+        weights[nonzero] = 1.0 / np.sqrt(counts[nonzero])
+    else:
+        raise ValueError(f"Unsupported class weighting scheme: {scheme}")
+
+    # Normalize around 1.0 and clip extremes to reduce instability.
+    weights = weights / weights[nonzero].mean()
+    weights = np.clip(weights, 1.0 / max_weight, max_weight)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train DeepInfant model")
@@ -242,17 +308,41 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--checkpoint-path", default="deepinfant.pth")
     parser.add_argument("--device", default=None, help="cpu|cuda (default: auto)")
     parser.add_argument(
         "--imbalance-mode",
         choices=["none", "sampler", "loss", "both"],
-        default="both",
+        default="loss",
         help="How to handle class imbalance in training set.",
     )
+    parser.add_argument(
+        "--class-weighting",
+        choices=["none", "sqrt_inv", "inv"],
+        default="sqrt_inv",
+        help="Class weighting function used by imbalance modes.",
+    )
+    parser.add_argument(
+        "--max-class-weight",
+        type=float,
+        default=4.0,
+        help="Clip absolute class weights to avoid unstable extremes.",
+    )
+    parser.add_argument(
+        "--scheduler",
+        choices=["none", "plateau"],
+        default="plateau",
+        help="LR scheduler strategy.",
+    )
+    parser.add_argument("--no-augment", action="store_true", help="Disable training augmentations.")
     return parser.parse_args()
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     # Set device
     if args.device:
         device = torch.device(args.device)
@@ -261,7 +351,7 @@ def main():
     print(f"Using device: {device}")
     
     # Create datasets using processed data
-    train_dataset = DeepInfantDataset(args.train_dir, transform=True)
+    train_dataset = DeepInfantDataset(args.train_dir, transform=(not args.no_augment))
     val_dataset = DeepInfantDataset(args.val_dir, transform=False)
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
@@ -274,13 +364,16 @@ def main():
 
     class_weights = None
     sample_weights = None
-    nonzero = class_counts > 0
-    if nonzero.any():
-        inv = np.zeros_like(class_counts, dtype=np.float64)
-        inv[nonzero] = 1.0 / class_counts[nonzero]
-        # Normalize around 1.0 to keep loss scale stable.
-        inv = inv * (class_counts[nonzero].mean())
-        class_weights = torch.tensor(inv, dtype=torch.float32)
+    if args.class_weighting != "none":
+        class_weights = compute_class_weights(
+            class_counts, scheme=args.class_weighting, max_weight=args.max_class_weight
+        )
+        print("Class weights:", [round(x, 4) for x in class_weights.tolist()])
+    else:
+        class_weights = torch.ones(num_classes, dtype=torch.float32)
+        print("Class weights: uniform")
+
+    if class_weights is not None:
         sample_weights = class_weights[torch.tensor(train_labels, dtype=torch.long)].double()
 
     # Create data loaders
@@ -315,14 +408,19 @@ def main():
     # Initialize model, loss function, and optimizer
     model = DeepInfantModel()
     use_loss_weights = args.imbalance_mode in ("loss", "both")
-    if use_loss_weights and class_weights is not None:
+    if use_loss_weights and class_weights is not None and args.class_weighting != "none":
         criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
         print("Imbalance handling: using class-weighted CrossEntropyLoss")
     else:
         criterion = nn.CrossEntropyLoss()
         if args.imbalance_mode in ("loss", "both"):
             print("Imbalance handling: class-weighted loss unavailable, using standard loss")
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = None
+    if args.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6
+        )
     
     # Train the model
     train_model(
@@ -333,6 +431,9 @@ def main():
         optimizer,
         num_epochs=args.epochs,
         device=device,
+        scheduler=scheduler,
+        grad_clip=args.grad_clip,
+        checkpoint_path=args.checkpoint_path,
     )
 
 if __name__ == '__main__':

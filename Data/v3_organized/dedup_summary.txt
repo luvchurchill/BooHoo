@@ -1,0 +1,20 @@
+Deduplication Summary
+=====================
+conflict_policy: skip
+total_candidates: 3274
+kept: 670
+duplicates_same_label: 179
+duplicates_label_conflict: 2425
+conflicts_skipped: 2425
+skipped_unmapped: 0
+
+Kept per class
+belly_pain: 48
+burping: 40
+cold_hot: 15
+discomfort: 47
+hungry: 32
+lonely: 21
+scared: 38
+tired: 20
+unknown: 409
