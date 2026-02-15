@@ -1,5 +1,10 @@
 # DeepInfant
 
+> **Status: Experimental Fork**
+>
+> This repository is a personal fork of the original DeepInfant project and is **not production-ready**.
+> It is currently used for experiments, data cleanup, and training trials.
+
 DeepInfant® is a Neural network system designed to predict whether and why your baby is crying.
 
 ![](https://raw.githubusercontent.com/skytells-research/DeepInfant/main/Assets/banner.png)
@@ -343,3 +348,4 @@ Copyright 2025 Skytells AI Research
 ```
 
 DeepInfant V2 is built on proprietary datasets along with publicly available datasets, ensuring robustness and real-world effectiveness in baby cry analysis.
+
