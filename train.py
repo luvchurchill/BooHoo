@@ -1,10 +1,11 @@
 import os
+import argparse
 import torch
 import torch.nn as nn
 import torchaudio
 import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 import librosa
 from pathlib import Path
@@ -15,6 +16,8 @@ class DeepInfantDataset(Dataset):
     def __init__(self, data_dir, transform=None):
         self.data_dir = Path(data_dir)
         self.transform = transform
+        # Backward-compatible behavior: callers currently pass bool for augmentation.
+        self.augment = bool(transform) if isinstance(transform, bool) else False
         self.samples = []
         self.labels = []
         
@@ -61,7 +64,7 @@ class DeepInfantDataset(Dataset):
         waveform, sample_rate = librosa.load(audio_path, sr=16000)
         
         # Add basic audio augmentation (during training)
-        if self.transform:
+        if self.augment:
             # Random time shift (-100ms to 100ms)
             shift = np.random.randint(-1600, 1600)
             if shift > 0:
@@ -107,7 +110,7 @@ class DeepInfantDataset(Dataset):
         # Process audio to mel spectrogram
         mel_spec = self._process_audio(audio_path)
         
-        if self.transform:
+        if callable(self.transform):
             mel_spec = self.transform(mel_spec)
         
         return mel_spec, label
@@ -116,7 +119,8 @@ class DeepInfantModel(nn.Module):
     def __init__(self, num_classes=9):
         super(DeepInfantModel, self).__init__()
         
-        # CNN layers with residual connections
+        # CNN feature extractor: preserve temporal/frequency structure for LSTM.
+        # With n_mels=80 and 3x MaxPool2d(2), frequency bins become 80 -> 40 -> 20 -> 10.
         self.conv_layers = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
@@ -131,14 +135,7 @@ class DeepInfantModel(nn.Module):
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.MaxPool2d(2),
-            
-            # Adding squeeze-and-excitation block
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(256, 16, 1),
-            nn.ReLU(),
-            nn.Conv2d(16, 256, 1),
-            nn.Sigmoid()
+            nn.MaxPool2d(2)
         )
         
         # Bi-directional LSTM for better temporal modeling
@@ -235,26 +232,108 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), 'deepinfant.pth')
+            print(f"Saved improved checkpoint to deepinfant.pth (val_acc={val_acc:.2f}%)")
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train DeepInfant model")
+    parser.add_argument("--train-dir", default="processed_dataset/train")
+    parser.add_argument("--val-dir", default="processed_dataset/test")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--device", default=None, help="cpu|cuda (default: auto)")
+    parser.add_argument(
+        "--imbalance-mode",
+        choices=["none", "sampler", "loss", "both"],
+        default="both",
+        help="How to handle class imbalance in training set.",
+    )
+    return parser.parse_args()
 
 def main():
+    args = parse_args()
     # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
     # Create datasets using processed data
-    train_dataset = DeepInfantDataset('processed_dataset/train', transform=True)
-    val_dataset = DeepInfantDataset('processed_dataset/test', transform=False)
-    
+    train_dataset = DeepInfantDataset(args.train_dir, transform=True)
+    val_dataset = DeepInfantDataset(args.val_dir, transform=False)
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+
+    # Compute class counts from training labels.
+    train_labels = np.array(train_dataset.labels, dtype=np.int64)
+    num_classes = len(train_dataset.label_map)
+    class_counts = np.bincount(train_labels, minlength=num_classes)
+    print("Train class counts:", class_counts.tolist())
+
+    class_weights = None
+    sample_weights = None
+    nonzero = class_counts > 0
+    if nonzero.any():
+        inv = np.zeros_like(class_counts, dtype=np.float64)
+        inv[nonzero] = 1.0 / class_counts[nonzero]
+        # Normalize around 1.0 to keep loss scale stable.
+        inv = inv * (class_counts[nonzero].mean())
+        class_weights = torch.tensor(inv, dtype=torch.float32)
+        sample_weights = class_weights[torch.tensor(train_labels, dtype=torch.long)].double()
+
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+    use_sampler = args.imbalance_mode in ("sampler", "both")
+    sampler = None
+    if use_sampler and sample_weights is not None:
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        print("Imbalance handling: using WeightedRandomSampler")
+    elif args.imbalance_mode == "none":
+        print("Imbalance handling: disabled")
+    else:
+        print("Imbalance handling: sampler not enabled")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=args.num_workers,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
     
     # Initialize model, loss function, and optimizer
     model = DeepInfantModel()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    use_loss_weights = args.imbalance_mode in ("loss", "both")
+    if use_loss_weights and class_weights is not None:
+        criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+        print("Imbalance handling: using class-weighted CrossEntropyLoss")
+    else:
+        criterion = nn.CrossEntropyLoss()
+        if args.imbalance_mode in ("loss", "both"):
+            print("Imbalance handling: class-weighted loss unavailable, using standard loss")
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
     # Train the model
-    train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50, device=device)
+    train_model(
+        model,
+        train_loader,
+        val_loader,
+        criterion,
+        optimizer,
+        num_epochs=args.epochs,
+        device=device,
+    )
 
 if __name__ == '__main__':
     main() 

@@ -27,6 +27,67 @@ Our research demonstrates that combining specialized audio processing with deep 
 ## Summary
 DeepInfant is a machine learning model that uses artificial intelligence to predict your baby's needs based on sound classification of cries.
 
+## Windows GUI (Record or Select File)
+This repository now includes a local GUI for Windows in `app.py` with two input options:
+
+1. `Record` using the laptop microphone.
+2. `Select File` and upload an audio file.
+
+The GUI runs prediction through `predict.py` using a local PyTorch checkpoint file (`deepinfant.pth`).
+
+### Setup with `uv`
+Use `uv` commands instead of `pip` or direct `python` calls:
+
+```bash
+uv sync
+```
+
+If you need to add dependencies manually:
+
+```bash
+uv add gradio librosa numpy pandas scikit-learn soundfile torch torchaudio tqdm
+```
+
+### Run the GUI
+```bash
+uv run app.py
+```
+
+Then open the local URL shown in the terminal (typically `http://127.0.0.1:7860`).
+
+### Model Checkpoint Requirement
+- Place `deepinfant.pth` in the repository root, or update `MODEL_PATH` in `app.py`.
+- The app supports both 5-class and 9-class checkpoints and chooses labels automatically.
+
+## Training with `uv`
+Use these commands to generate a PyTorch checkpoint (`deepinfant.pth`) for the Windows GUI.
+
+### 1) Prepare train/test split
+```bash
+uv run prepare_dataset.py
+```
+
+This creates:
+- `processed_dataset/train`
+- `processed_dataset/test`
+- `processed_dataset/metadata.csv`
+
+### 2) Minimal smoke test (quick verification)
+Run one epoch on CPU to verify your environment and training loop:
+
+```bash
+uv run train.py --device cpu --epochs 1 --batch-size 8 --num-workers 0
+```
+
+### 3) Full training run (copy/paste)
+```bash
+uv run train.py --device cpu --epochs 50 --batch-size 32 --num-workers 0
+```
+
+Notes:
+- On CPU laptops, the full run can take hours depending on hardware.
+- The best checkpoint is saved automatically as `deepinfant.pth` whenever validation accuracy improves.
+
 ## Dataset
 DeepInfant was initially developed as part of a final project in the Speech Technology Course at KTH (Royal Institute of Technology, Sweden). The latest version, **DeepInfant V2**, has been trained using a combination of private datasets along with published datasets to improve its generalization and accuracy. The training was further enhanced based on the V1 methodologies with additional refinements to optimize performance.
 
