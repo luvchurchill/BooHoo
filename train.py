@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+import warnings
 
 import librosa
 import numpy as np
@@ -25,6 +26,47 @@ LABEL_MAP = {
 }
 
 SUPPORTED_AUDIO_EXTS = {".wav", ".caf", ".3gp", ".mp3", ".ogg", ".m4a"}
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.strip().lower()
+    if value in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, got: {value}")
+
+
+def _should_quiet_warning(message, category, filename):
+    text = str(message)
+    if category is UserWarning and "PySoundFile failed. Trying audioread instead" in text:
+        return True
+    if category is FutureWarning and "__audioread_load" in text and "librosa" in str(filename):
+        return True
+    return False
+
+
+def configure_warning_filters(show_warnings=False, warning_log_path=""):
+    if show_warnings:
+        return
+
+    original_showwarning = warnings.showwarning
+    log_path = warning_log_path.strip()
+
+    def custom_showwarning(message, category, filename, lineno, file=None, line=None):
+        if _should_quiet_warning(message, category, filename):
+            if log_path:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"{category.__name__}: {message} "
+                        f"({filename}:{lineno})\n"
+                    )
+            return
+        original_showwarning(message, category, filename, lineno, file=file, line=line)
+
+    warnings.showwarning = custom_showwarning
 
 
 class DeepInfantDataset(Dataset):
@@ -245,6 +287,7 @@ def train_model(
     monitor="val_macro_f1",
     early_stop_patience=10,
     mixup_alpha=0.0,
+    show_progress=True,
 ):
     model = model.to(device)
     monitor_mode = "min" if monitor == "val_loss" else "max"
@@ -261,7 +304,9 @@ def train_model(
         train_correct = 0
         train_total = 0
 
-        for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}"):
+        for inputs, labels in tqdm(
+            train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}", disable=(not show_progress)
+        ):
             inputs, labels = inputs.to(device), labels.to(device)
             inputs = inputs.unsqueeze(1)
             inputs, labels_a, labels_b, lam = _mixup_batch(inputs, labels, mixup_alpha)
@@ -453,6 +498,23 @@ def parse_args():
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--focal-gamma", type=float, default=0.0)
     parser.add_argument("--mixup-alpha", type=float, default=0.0)
+    parser.add_argument(
+        "--show-warnings",
+        type=str2bool,
+        default=False,
+        help="Show all Python warnings. By default, known noisy audio warnings are suppressed.",
+    )
+    parser.add_argument(
+        "--warning-log-path",
+        default="",
+        help="Optional file path to append suppressed warning lines.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        type=str2bool,
+        default=False,
+        help="Disable tqdm progress bars.",
+    )
     parser.add_argument("--no-augment", action="store_true", help="Disable training augmentations.")
     return parser.parse_args()
 
@@ -546,12 +608,17 @@ def run_single_seed(args, seed, checkpoint_path, device):
         monitor=args.monitor,
         early_stop_patience=args.early_stop_patience,
         mixup_alpha=args.mixup_alpha,
+        show_progress=(not args.no_progress),
     )
     return metrics
 
 
 def main():
     args = parse_args()
+    configure_warning_filters(
+        show_warnings=args.show_warnings,
+        warning_log_path=args.warning_log_path,
+    )
     seeds = parse_seed_list(args.seed, args.seed_list)
     if args.device:
         device = torch.device(args.device)

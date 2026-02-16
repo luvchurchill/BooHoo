@@ -13,8 +13,10 @@ from train import (
     DeepInfantModel,
     LABEL_MAP,
     build_criterion,
+    configure_warning_filters,
     compute_class_weights,
     set_seed,
+    str2bool,
     train_model,
 )
 
@@ -125,6 +127,23 @@ def parse_args():
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--focal-gamma", type=float, default=0.0)
     parser.add_argument("--mixup-alpha", type=float, default=0.0)
+    parser.add_argument(
+        "--show-warnings",
+        type=str2bool,
+        default=False,
+        help="Show all Python warnings. By default, known noisy audio warnings are suppressed.",
+    )
+    parser.add_argument(
+        "--warning-log-path",
+        default="",
+        help="Optional file path to append suppressed warning lines.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        type=str2bool,
+        default=True,
+        help="Disable tqdm progress bars. Default is true for cleaner cross-validation logs.",
+    )
 
     parser.add_argument(
         "--unknown-strategy",
@@ -138,6 +157,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    configure_warning_filters(
+        show_warnings=args.show_warnings,
+        warning_log_path=args.warning_log_path,
+    )
     set_seed(args.seed)
     if args.device:
         device = torch.device(args.device)
@@ -249,6 +272,7 @@ def main():
             monitor=args.monitor,
             early_stop_patience=args.early_stop_patience,
             mixup_alpha=args.mixup_alpha,
+            show_progress=(not args.no_progress),
         )
         fold_rows.append(
             {
