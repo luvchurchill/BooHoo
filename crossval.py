@@ -10,8 +10,8 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from train import (
     DeepInfantDataset,
-    DeepInfantModel,
     LABEL_MAP,
+    build_model,
     build_criterion,
     configure_warning_filters,
     compute_class_weights,
@@ -93,6 +93,17 @@ def parse_args():
     parser.add_argument("--device", default=None, help="cpu|cuda (default: auto)")
     parser.add_argument("--checkpoint-prefix", default="deepinfant_cv")
     parser.add_argument("--output-csv", default="cv_results.csv")
+    parser.add_argument(
+        "--backbone",
+        choices=["cnn_lstm", "wav2vec2_base"],
+        default="cnn_lstm",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        type=str2bool,
+        default=True,
+        help="For pretrained backbones, freeze encoder and train only classifier head.",
+    )
 
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -167,6 +178,8 @@ def main():
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    feature_type = "waveform" if args.backbone == "wav2vec2_base" else "mel"
+    print(f"Feature type: {feature_type}")
 
     samples, labels = collect_samples(
         source_dir=args.source_dir,
@@ -191,8 +204,18 @@ def main():
         train_labels = labels_np[train_idx].tolist()
         val_labels = labels_np[val_idx].tolist()
 
-        train_dataset = DeepInfantDataset(samples=train_samples, labels=train_labels, transform=(not args.no_augment))
-        val_dataset = DeepInfantDataset(samples=val_samples, labels=val_labels, transform=False)
+        train_dataset = DeepInfantDataset(
+            samples=train_samples,
+            labels=train_labels,
+            transform=(not args.no_augment),
+            feature_type=feature_type,
+        )
+        val_dataset = DeepInfantDataset(
+            samples=val_samples,
+            labels=val_labels,
+            transform=False,
+            feature_type=feature_type,
+        )
 
         class_counts = np.bincount(np.asarray(train_labels, dtype=np.int64), minlength=len(LABEL_MAP))
         print("Fold train class counts:", class_counts.tolist())
@@ -236,9 +259,10 @@ def main():
             num_workers=args.num_workers,
         )
 
-        model = DeepInfantModel()
+        model = build_model(args, len(LABEL_MAP))
         criterion = build_criterion(args, class_weights, device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
         scheduler = None
         if args.scheduler == "plateau":

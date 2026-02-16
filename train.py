@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
 from sklearn.metrics import f1_score, recall_score
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
@@ -70,14 +71,17 @@ def configure_warning_filters(show_warnings=False, warning_log_path=""):
 
 
 class DeepInfantDataset(Dataset):
-    def __init__(self, data_dir=None, transform=None, samples=None, labels=None):
+    def __init__(self, data_dir=None, transform=None, samples=None, labels=None, feature_type="mel"):
         self.data_dir = Path(data_dir) if data_dir is not None else None
         self.transform = transform
         # Backward-compatible behavior: callers currently pass bool for augmentation.
         self.augment = bool(transform) if isinstance(transform, bool) else False
+        self.feature_type = feature_type
         self.samples = []
         self.labels = []
         self.label_map = LABEL_MAP.copy()
+        if self.feature_type not in {"mel", "waveform"}:
+            raise ValueError(f"Unsupported feature_type: {self.feature_type}")
 
         if samples is not None:
             if labels is None:
@@ -143,6 +147,10 @@ class DeepInfantDataset(Dataset):
             waveform = waveform[:target_length]
         else:
             waveform = np.pad(waveform, (0, target_length - len(waveform)))
+
+        if self.feature_type == "waveform":
+            waveform = (waveform - np.mean(waveform)) / (np.std(waveform) + 1e-6)
+            return torch.FloatTensor(waveform)
 
         mel_spec = librosa.feature.melspectrogram(
             y=waveform,
@@ -214,6 +222,35 @@ class DeepInfantModel(nn.Module):
         x, _ = self.lstm(x)
         x = x[:, -1, :]
         return self.classifier(x)
+
+
+class Wav2Vec2Classifier(nn.Module):
+    expects_waveform = True
+
+    def __init__(self, num_classes=9, freeze_backbone=True, dropout=0.3):
+        super().__init__()
+        bundle = torchaudio.pipelines.WAV2VEC2_BASE
+        self.backbone = bundle.get_model()
+
+        with torch.no_grad():
+            dummy_waveform = torch.zeros(1, 16000)
+            features, _ = self.backbone(dummy_waveform)
+            feature_dim = int(features.shape[-1])
+
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Dropout(dropout),
+            nn.Linear(feature_dim, num_classes),
+        )
+
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+    def forward(self, x):
+        features, _ = self.backbone(x)
+        pooled = features.mean(dim=1)
+        return self.classifier(pooled)
 
 
 class FocalCrossEntropyLoss(nn.Module):
@@ -308,7 +345,8 @@ def train_model(
             train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}", disable=(not show_progress)
         ):
             inputs, labels = inputs.to(device), labels.to(device)
-            inputs = inputs.unsqueeze(1)
+            if inputs.ndim == 3:
+                inputs = inputs.unsqueeze(1)
             inputs, labels_a, labels_b, lam = _mixup_batch(inputs, labels, mixup_alpha)
 
             optimizer.zero_grad()
@@ -340,7 +378,8 @@ def train_model(
         with torch.no_grad():
             for inputs, labels in val_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
-                inputs = inputs.unsqueeze(1)
+                if inputs.ndim == 3:
+                    inputs = inputs.unsqueeze(1)
 
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
@@ -424,6 +463,23 @@ def parse_seed_list(seed, seed_list_text):
     return [int(x.strip()) for x in seed_list_text.split(",") if x.strip()]
 
 
+def build_model(args, num_classes):
+    if args.backbone == "cnn_lstm":
+        return DeepInfantModel(num_classes=num_classes)
+
+    if args.backbone == "wav2vec2_base":
+        print(
+            "Backbone: wav2vec2_base "
+            f"(pretrained bundle, freeze_backbone={args.freeze_backbone})"
+        )
+        return Wav2Vec2Classifier(
+            num_classes=num_classes,
+            freeze_backbone=args.freeze_backbone,
+        )
+
+    raise ValueError(f"Unsupported backbone: {args.backbone}")
+
+
 def build_criterion(args, class_weights, device):
     use_loss_weights = args.imbalance_mode in ("loss", "both")
     weight = None
@@ -459,6 +515,18 @@ def parse_args():
     parser.add_argument("--seed-list", default="", help="Comma-separated seed list, e.g. 42,43")
     parser.add_argument("--checkpoint-path", default="deepinfant.pth")
     parser.add_argument("--device", default=None, help="cpu|cuda (default: auto)")
+    parser.add_argument(
+        "--backbone",
+        choices=["cnn_lstm", "wav2vec2_base"],
+        default="cnn_lstm",
+        help="Model backbone architecture.",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        type=str2bool,
+        default=True,
+        help="For pretrained backbones, freeze encoder and train only classifier head.",
+    )
     parser.add_argument(
         "--imbalance-mode",
         choices=["none", "sampler", "loss", "both"],
@@ -522,8 +590,18 @@ def parse_args():
 def run_single_seed(args, seed, checkpoint_path, device):
     set_seed(seed)
 
-    train_dataset = DeepInfantDataset(args.train_dir, transform=(not args.no_augment))
-    val_dataset = DeepInfantDataset(args.val_dir, transform=False)
+    feature_type = "waveform" if args.backbone == "wav2vec2_base" else "mel"
+    print(f"Feature type: {feature_type}")
+    train_dataset = DeepInfantDataset(
+        args.train_dir,
+        transform=(not args.no_augment),
+        feature_type=feature_type,
+    )
+    val_dataset = DeepInfantDataset(
+        args.val_dir,
+        transform=False,
+        feature_type=feature_type,
+    )
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
 
@@ -573,9 +651,10 @@ def run_single_seed(args, seed, checkpoint_path, device):
         num_workers=args.num_workers,
     )
 
-    model = DeepInfantModel()
+    model = build_model(args, num_classes)
     criterion = build_criterion(args, class_weights, device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
     scheduler = None
     if args.scheduler == "plateau":

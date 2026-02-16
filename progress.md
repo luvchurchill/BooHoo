@@ -1,101 +1,140 @@
-# DeepInfant Windows GUI + Training Progress Log
+# DeepInfant Progress Log
 
-## Date
-- 2026-02-15
+## Date Range
+- 2026-02-15 to 2026-02-16
 
-## Goal
-- Make DeepInfant easy to use on Windows with:
-  - microphone recording path
-  - file upload path
-- Keep Python workflow on `uv`.
-- Produce/verify a usable PyTorch checkpoint flow for local inference.
+## Project Goals
+- Keep local workflow simple on Windows with `uv`.
+- Train a usable PyTorch checkpoint for local inference and GUI use.
+- Improve model behavior on imbalanced 9-class data.
+- Make training/cross-validation logs easier to read and share.
 
-## What Was Implemented
+## Work Completed
 
-### 1) Windows GUI
-- Added `app.py` using Gradio with two explicit paths:
-  - `Record` (microphone)
-  - `Select File` (upload)
-- Added prediction outputs:
-  - predicted label
-  - confidence
-  - caregiver tip
+### 1) Windows GUI + Inference Flow
+- Added `app.py` (Gradio) with:
+  - `Record` path (microphone)
+  - `Select File` path (upload)
+- Updated `predict.py` for robust checkpoint loading:
+  - supports raw state dict / `state_dict` / `model_state_dict`
+  - infers class count from classifier shape
+  - supports both 5-class and 9-class labels
+  - clearer failure messages for bad checkpoints/audio
 
-### 2) Predictor Compatibility + Robustness
-- Updated `predict.py` to:
-  - load checkpoints more robustly (`state_dict`, `model_state_dict`, raw state dict)
-  - infer class count from classifier weights
-  - support both 5-class and 9-class label maps
-  - fail clearly on missing/invalid checkpoint or unreadable audio
-
-### 3) `uv` Project Setup and Instructions
-- Added `pyproject.toml`.
-- Added `AGENTS.md` guidance to use:
+### 2) Environment + Packaging
+- Added/updated project metadata for `uv` workflow.
+- Documented usage in `README.md`.
+- Standardized commands around:
   - `uv add ...`
   - `uv run ...`
-- Updated docs in `README.md` for GUI launch and training commands.
-- Updated `requirements.txt` with GUI/runtime dependencies.
 
-## What Went Wrong and How It Was Fixed
+### 3) Training Pipeline Fixes (Stability + Correctness)
+- Fixed dataset transform/augmentation handling bug:
+  - bool transform is treated as augmentation toggle
+  - callable transforms are invoked only when callable
+- Fixed model shape flow:
+  - preserved temporal/frequency structure needed by LSTM input
+  - removed incompatible collapsing behavior that caused reshape failure
 
-### Issue A: Training crashed immediately with transform error
-- Root cause:
-  - `DeepInfantDataset` accepted `transform=True/False` but later called it like a function.
-- Fix:
-  - treat boolean transform as augmentation toggle (`self.augment`)
-  - only call `self.transform(...)` when it is callable
+### 4) Imbalance and Metric Improvements
+- Added configurable imbalance handling:
+  - `--imbalance-mode {none,sampler,loss,both}`
+  - class-weighting schemes with clipping
+- Switched monitoring emphasis to macro-quality metrics:
+  - macro-F1
+  - balanced accuracy
 
-### Issue B: Training crashed with invalid reshape in model forward pass
-- Error observed:
-  - `RuntimeError: shape '[8, -1, 2560]' is invalid for input of size 2048`
-- Root cause:
-  - CNN ended with `AdaptiveAvgPool2d(1)` which destroyed temporal/frequency structure needed by LSTM reshape.
-- Fix:
-  - removed collapsing tail from CNN
-  - preserved pooled frequency size to match `input_size=256*10` for the LSTM
+### 5) Dataset Preparation Improvements
+- `prepare_dataset.py` updated to support:
+  - `--unknown-strategy {keep,cap,drop}`
+  - `--unknown-cap-ratio` (default `0.35`)
+  - stratified split option (`--stratify`, default `true`)
+  - minimum per-class guard (`--min-per-class`, default `5`)
+  - broader audio extensions support (`.wav`, `.mp3`, `.caf`, `.3gp`, `.ogg`, `.m4a`)
+- Added cleanup of stale generated WAVs before re-preparing split.
+- Fixed edge case: `unknown=drop` no longer fails min-class guard for unknown.
 
-### Issue C: Accuracy got stuck exactly at ~64.35% train and ~62.60% val
-- Observation:
-  - train/val accuracy matched majority class percentages exactly.
-- Root cause:
-  - severe class imbalance (`hungry` dominates dataset).
-- Fix:
-  - added imbalance handling in `train.py`:
-    - `WeightedRandomSampler`
-    - class-weighted `CrossEntropyLoss`
-    - configurable via `--imbalance-mode {none,sampler,loss,both}` (default: `both`)
+### 6) Training Strategy Upgrade (`train.py`)
+- Added/changed defaults focused on stable generalization:
+  - `--epochs 60`
+  - `--lr 3e-4`
+  - `--weight-decay 5e-4`
+  - `--imbalance-mode loss`
+  - `--scheduler cosine`
+  - `--max-class-weight 3.0`
+  - `--label-smoothing 0.05`
+- Added:
+  - monitor selection (`--monitor val_macro_f1|val_loss`)
+  - early stopping (`--early-stop-patience`)
+  - focal-loss option (`--focal-gamma`)
+  - mixup option (`--mixup-alpha`)
+  - multi-seed runs (`--seed-list`)
+- Kept checkpointing based on selected monitor and printout of key metrics each epoch.
 
-## Dataset Split Facts (from current processed metadata)
-- Train: 474 samples
-- Validation/Test: 123 samples
-- Majority class was `hungry`:
-  - train: `305/474 = 64.35%`
-  - val: `77/123 = 62.60%`
+### 7) Cross-Validation Entry Point (`crossval.py`)
+- Added stratified K-fold training runner:
+  - `--cv-folds` (default `5`)
+  - same optimizer/loss/scheduler knobs as `train.py`
+  - same unknown handling and min-class guards
+- Outputs fold metrics + aggregate mean/std to CSV (`--output-csv`).
+
+### 8) Log Noise Cleanup (Crossval Paste-Friendly Output)
+- Added targeted warning filtering (default ON) to suppress recurring noise only:
+  - `PySoundFile failed. Trying audioread instead`
+  - librosa `__audioread_load` deprecation warning
+- Added warning controls:
+  - `--show-warnings` (default `false`)
+  - `--warning-log-path` (optional file for suppressed warnings)
+- Added progress-bar controls:
+  - `train.py`: `--no-progress` default `false`
+  - `crossval.py`: `--no-progress` default `true` (cleaner shared logs)
+
+## Latest Training Result Snapshot (Single Seed)
+- Device: `cuda`
+- Seed: `42`
+- Train/Val samples: `281 / 71`
+- Best validation metrics observed:
+  - `Val Macro-F1: 0.6466`
+  - `Val Accuracy: 67.61%`
+  - `Val Balanced Accuracy: 0.6201`
+- Early stopping triggered at epoch `59` (patience `10`).
 
 ## Current Recommended Commands
 
-### Smoke test (3 epochs)
+### Prepare data (capped unknown, stratified split)
 ```powershell
-uv run train.py --device cpu --epochs 3 --batch-size 32 --num-workers 0 --imbalance-mode both
+uv run prepare_dataset.py --unknown-strategy cap --unknown-cap-ratio 0.35 --stratify true --min-per-class 5
 ```
 
-### Full run
+### Single training run (default improved settings)
 ```powershell
-uv run train.py --device cpu --epochs 50 --batch-size 32 --num-workers 0 --imbalance-mode both
+uv run train.py --device cuda
 ```
 
-### Launch GUI
+### Multi-seed training
 ```powershell
-uv run app.py
+uv run train.py --device cuda --seed-list 42,43
 ```
+
+### Cross-validation (clean logs by default)
+```powershell
+uv run crossval.py --device cuda --cv-folds 5 --output-csv cv_results.csv
+```
+
+### Cross-validation with warning visibility
+```powershell
+uv run crossval.py --device cuda --cv-folds 5 --show-warnings true
+```
+
+## Notes / Known Constraints
+- Dataset is still relatively small and class-imbalanced; fold variance is expected.
+- Current model is improved and usable, but further gains likely require:
+  - more/cleaner data for minority classes
+  - repeated-seed CV comparisons
+  - targeted augmentation tuning
 
 ## Artifacts to Keep Out of Git
 - `processed_dataset/`
 - `deepinfant.pth`
-- local env/cache artifacts
-
-## Notes for Future You
-- If accuracy pins to a constant near majority proportion again, re-check:
-  - class counts
-  - sampler and loss weighting enabled
-  - per-class metrics (not only accuracy)
+- `deepinfant_cv_fold*.pth`
+- local cache and environment artifacts

@@ -70,6 +70,11 @@ class InfantCryPredictor:
         )
 
     def _infer_num_classes(self, state_dict):
+        if any(key.startswith("backbone.") for key in state_dict):
+            raise ValueError(
+                "Checkpoint appears to use a waveform pretrained backbone (for example wav2vec2). "
+                "Current predict.py supports only the CNN-LSTM mel-spectrogram model."
+            )
         classifier_weight_keys = ['classifier.3.weight', 'classifier.1.weight']
         for key in classifier_weight_keys:
             if key in state_dict:
