@@ -1,12 +1,11 @@
-import os
-import shutil
+import argparse
 from pathlib import Path
 import pandas as pd
 from sklearn.model_selection import train_test_split
 import librosa
 import soundfile as sf
 
-def prepare_dataset(source_dir="Data/v2", output_dir="processed_dataset", test_size=0.2):
+def prepare_dataset(source_dir="Data/v3_organized", output_dir="processed_dataset", test_size=0.2, seed=42):
     """
     Prepare the dataset by organizing and splitting audio files.
     
@@ -54,7 +53,7 @@ def prepare_dataset(source_dir="Data/v2", output_dir="processed_dataset", test_s
             
             # Split files into train and test
             train_files, test_files = train_test_split(
-                audio_files, test_size=test_size, random_state=42
+                audio_files, test_size=test_size, random_state=seed
             )
             
             # Process and copy files
@@ -90,5 +89,20 @@ def prepare_dataset(source_dir="Data/v2", output_dir="processed_dataset", test_s
     print("\nClass distribution:")
     print(metadata_df.groupby(['split', 'class']).size().unstack(fill_value=0))
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Prepare DeepInfant dataset splits")
+    parser.add_argument("--source-dir", default="Data/v3_organized", help="Source class folder root")
+    parser.add_argument("--output-dir", default="processed_dataset", help="Output directory")
+    parser.add_argument("--test-size", type=float, default=0.2, help="Test split ratio")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    prepare_dataset() 
+    args = parse_args()
+    prepare_dataset(
+        source_dir=args.source_dir,
+        output_dir=args.output_dir,
+        test_size=args.test_size,
+        seed=args.seed,
+    )
