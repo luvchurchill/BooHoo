@@ -6,13 +6,41 @@ from sklearn.model_selection import train_test_split
 import librosa
 import soundfile as sf
 
+
+CLASS_MAPPING = {
+    "belly_pain": "bp",
+    "burping": "bu",
+    "cold_hot": "ch",
+    "discomfort": "dc",
+    "hungry": "hu",
+    "lonely": "lo",
+    "scared": "sc",
+    "tired": "ti",
+    "unknown": "un",
+}
+SUPPORTED_EXTS = (".wav", ".mp3", ".caf", ".3gp", ".ogg", ".m4a")
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.strip().lower()
+    if value in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, got: {value}")
+
+
 def prepare_dataset(
     source_dir="Data/v3_organized",
     output_dir="processed_dataset",
     test_size=0.2,
     seed=42,
-    unknown_strategy="keep",
-    unknown_cap_ratio=1.0,
+    unknown_strategy="cap",
+    unknown_cap_ratio=0.35,
+    stratify=True,
+    min_per_class=5,
 ):
     """
     Prepare the dataset by organizing and splitting audio files.
@@ -30,19 +58,6 @@ def prepare_dataset(
     for path in [train_path, test_path]:
         path.mkdir(parents=True, exist_ok=True)
         
-    # Define class mapping
-    class_mapping = {
-        'belly_pain': 'bp',
-        'burping': 'bu',
-        'cold_hot': 'ch',
-        'discomfort': 'dc',
-        'hungry': 'hu',
-        'lonely': 'lo',
-        'scared': 'sc',
-        'tired': 'ti',
-        'unknown': 'un'
-    }
-    
     # Create metadata list
     metadata = []
     rng = random.Random(seed)
@@ -53,10 +68,9 @@ def prepare_dataset(
     for class_folder in source_path.iterdir():
         if class_folder.is_dir():
             class_name = class_folder.name
-            audio_files = list(class_folder.glob("*.wav")) + \
-                         list(class_folder.glob("*.mp3")) + \
-                         list(class_folder.glob("*.caf")) + \
-                         list(class_folder.glob("*.3gp"))
+            audio_files = [
+                p for p in class_folder.glob("*.*") if p.suffix.lower() in SUPPORTED_EXTS
+            ]
             class_files[class_name] = audio_files
 
     if unknown_strategy == "drop":
@@ -80,45 +94,71 @@ def prepare_dataset(
     else:
         print("Unknown handling: keeping all unknown samples.")
 
-    # Process each class folder
+    # Validate class counts and flatten all files for global split.
+    all_rows = []
     for class_name, audio_files in class_files.items():
-        if class_name not in class_mapping:
+        if class_name not in CLASS_MAPPING:
             continue
-        class_code = class_mapping[class_name]
-            
-        if len(audio_files) < 2:
-            print(f"Skipping class '{class_name}' due to insufficient files ({len(audio_files)}).")
+        if class_name == "unknown" and unknown_strategy == "drop" and len(audio_files) == 0:
             continue
+        if len(audio_files) < min_per_class:
+            raise ValueError(
+                f"Class '{class_name}' has {len(audio_files)} samples, below --min-per-class={min_per_class}."
+            )
+        class_code = CLASS_MAPPING[class_name]
+        for audio_file in audio_files:
+            all_rows.append((audio_file, class_name, class_code))
 
-        # Split files into train and test
-        train_files, test_files = train_test_split(
-            audio_files, test_size=test_size, random_state=seed
-        )
+    if not all_rows:
+        raise ValueError("No audio files found after filtering.")
 
-        # Process and copy files
-        for files, split_path in [(train_files, train_path), (test_files, test_path)]:
-            for audio_file in files:
-                # Load and resample audio to 16kHz
-                try:
-                    y, sr = librosa.load(audio_file, sr=16000)
-                    
-                    # Generate new filename
-                    new_filename = f"{audio_file.stem}-{class_code}.wav"
-                    output_file = split_path / new_filename
-                    
-                    # Save processed audio
-                    sf.write(output_file, y, sr, subtype='PCM_16')
-                    
-                    # Add to metadata
-                    metadata.append({
-                        'filename': new_filename,
-                        'class': class_name,
-                        'class_code': class_code,
-                        'split': 'train' if split_path == train_path else 'test'
-                    })
-                    
-                except Exception as e:
-                    print(f"Error processing {audio_file}: {str(e)}")
+    all_classes = [row[1] for row in all_rows]
+    indices = list(range(len(all_rows)))
+    stratify_labels = all_classes if stratify else None
+    train_idx, test_idx = train_test_split(
+        indices,
+        test_size=test_size,
+        random_state=seed,
+        stratify=stratify_labels,
+    )
+
+    # Remove stale generated WAVs so repeated runs stay consistent.
+    for split_path in (train_path, test_path):
+        for old_file in split_path.glob("*.wav"):
+            old_file.unlink()
+
+    split_items = [
+        (train_idx, train_path, "train"),
+        (test_idx, test_path, "test"),
+    ]
+
+    # Process and copy files
+    for split_idx, split_path, split_name in split_items:
+        for idx in split_idx:
+            audio_file, class_name, class_code = all_rows[idx]
+            # Load and resample audio to 16kHz
+            try:
+                y, sr = librosa.load(audio_file, sr=16000)
+
+                # Generate new filename
+                new_filename = f"{audio_file.stem}-{class_code}.wav"
+                output_file = split_path / new_filename
+
+                # Save processed audio
+                sf.write(output_file, y, sr, subtype="PCM_16")
+
+                # Add to metadata
+                metadata.append(
+                    {
+                        "filename": new_filename,
+                        "class": class_name,
+                        "class_code": class_code,
+                        "split": split_name,
+                    }
+                )
+
+            except Exception as e:
+                print(f"Error processing {audio_file}: {str(e)}")
     
     # Save metadata to CSV
     metadata_df = pd.DataFrame(metadata)
@@ -137,14 +177,26 @@ def parse_args():
     parser.add_argument(
         "--unknown-strategy",
         choices=["keep", "cap", "drop"],
-        default="keep",
+        default="cap",
         help="How to handle the unknown class before splitting.",
     )
     parser.add_argument(
         "--unknown-cap-ratio",
         type=float,
-        default=1.0,
+        default=0.35,
         help="When using --unknown-strategy cap, keep at most ratio*known_total unknown samples.",
+    )
+    parser.add_argument(
+        "--stratify",
+        type=str2bool,
+        default=True,
+        help="Whether to use stratified global train/test split.",
+    )
+    parser.add_argument(
+        "--min-per-class",
+        type=int,
+        default=5,
+        help="Fail if any class has fewer than this many samples after filtering.",
     )
     return parser.parse_args()
 
@@ -158,4 +210,6 @@ if __name__ == "__main__":
         seed=args.seed,
         unknown_strategy=args.unknown_strategy,
         unknown_cap_ratio=args.unknown_cap_ratio,
+        stratify=args.stratify,
+        min_per_class=args.min_per_class,
     )
