@@ -316,7 +316,7 @@ def parse_args():
     parser.add_argument(
         "--imbalance-mode",
         choices=["none", "sampler", "loss", "both"],
-        default="loss",
+        default="both",
         help="How to handle class imbalance in training set.",
     )
     parser.add_argument(
